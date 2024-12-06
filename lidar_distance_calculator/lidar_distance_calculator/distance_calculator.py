@@ -8,12 +8,15 @@ import tf2_ros
 import geometry_msgs.msg
 from geometry_msgs.msg import Point
 import tf_transformations
-from sklearn.cluster import DBSCAN
+from sklearn.cluster import DBSCAN, KMeans
 from sklearn.neighbors import NearestNeighbors
 from scipy.spatial.distance import pdist
+from sklearn.linear_model import RANSACRegressor
 import matplotlib.pyplot as plt
 import os
 from visualization_msgs.msg import Marker
+from rclpy.parameter import Parameter
+from rcl_interfaces.msg import SetParametersResult
 
 
 class States(enum.Enum):
@@ -27,9 +30,29 @@ class function:
     """Class to categorize groups into width and length based on distance thresholds"""
 
     # def __init__(self, width_range=(0.60, 0.63), length_range=(0.63, 0.70)):
-    def __init__(self, width_range=(0.60, 0.65), length_range=(0.60, 0.65)):
-        self.width_range = width_range
-        self.length_range = length_range
+    def __init__(self, default_shape=None):
+        # Default ranges for shapes
+        self.cylinder_width_range = (0.60, 0.65)  # Example range for cylinder
+        self.cylinder_length_range = (0.0, 0.0)  # Example range for cylinder
+        self.square_width_range = (0.60, 0.63)
+        self.square_length_range = (0.63, 0.70)
+
+        # Initialize default shape
+        self.set_shape(default_shape)
+
+    def set_shape(self, shape):
+        """Set shape type and adjust the range values accordingly"""
+        shape = shape.lower()
+        if shape == 'cylinder':
+            self.shape = 'cylinder'
+            self.width_range = self.cylinder_width_range
+            self.length_range = self.cylinder_length_range
+        elif shape == 'square':
+            self.shape = 'square'
+            self.width_range = self.square_width_range
+            self.length_range = self.square_length_range
+        else:
+            raise ValueError("Invalid shape: must be 'cylinder' or 'square'")
 
     def categorize_distance(self, group1, group2):
         """Categorize the distance between two groups as width or length based on predefined ranges"""
@@ -64,6 +87,8 @@ class DistanceCalculator(Node):
         super().__init__('distance_calculator')
         self.current_state = States.IDLE
         self.marker_pub = self.create_publisher(Marker, 'visualization_marker', 10)
+        self.marker_publisher = self.create_publisher(Marker, '/bounding_box_marker', 10)
+
         self.subscription = self.create_subscription(
             LaserScan,
             '/scan_filtered',
@@ -76,6 +101,7 @@ class DistanceCalculator(Node):
         # Parameters
         self.declare_parameter('proximity_threshold', 0.03)
         self.declare_parameter('offset_length', -0.68)
+        self.declare_parameter('shape', 'square')  # Default value
         self.time_threshold_ns = 0.5 * 1e9
 
         # Real-time plotting setup
@@ -87,7 +113,23 @@ class DistanceCalculator(Node):
         os.makedirs(self.plot_dir, exist_ok=True)
 
         # Initialize function categorization class
-        self.function = function()
+        shape = self.get_parameter('shape').get_parameter_value().string_value
+        self.function = function(shape)
+
+        # Add parameter callback
+        self.add_on_set_parameters_callback(self.parameter_callback)
+
+    def parameter_callback(self, params):
+        """Callback to handle parameter updates"""
+        for param in params:
+            if param.name == 'shape' and param.type_ == Parameter.Type.STRING:
+                try:
+                    self.function.set_shape(param.value)
+                    self.get_logger().info(f"Shape updated to: {param.value}")
+                except ValueError as e:
+                    self.get_logger().error(str(e))
+                    return SetParametersResult(successful=False)
+        return SetParametersResult(successful=True)
 
     def state_machine(self):
         """State machine logic"""
@@ -120,9 +162,22 @@ class DistanceCalculator(Node):
 
     def lidar_callback(self, msg):
         """Lidar data processing"""
+        x_min, x_max = 0.3, 1.25
+        y_min, y_max = -0.5, 0.5
+
+        cropped_points = []
+        for i in range(len(msg.ranges)):
+            distance = msg.ranges[i]
+            angle = msg.angle_min + i * msg.angle_increment
+            x = distance * math.cos(angle)
+            y = distance * math.sin(angle)
+            if x_min <= x <= x_max and y_min <= y <= y_max:
+                cropped_points.append((x, y))
+
+        self.publish_bounding_box(x_min, x_max, y_min, y_max)
         proximity_threshold = self.get_proximity_threshold()
         offset_length = self.get_offset_length()
-        detected_points = self.filter_points(msg)
+        detected_points = cropped_points
         grouped_points = self.group_points(detected_points, proximity_threshold=proximity_threshold)
 
         self.last_object_time = self.get_clock().now() if detected_points else None
@@ -208,6 +263,31 @@ class DistanceCalculator(Node):
                             self.x_outer1, self.y_outer1, "outer_corner_1", quaternion)
                         self.send_transform(
                             self.x_outer2, self.y_outer2, "outer_corner_2", quaternion)
+
+    def publish_bounding_box(self, x_min, x_max, y_min, y_max):
+        marker = Marker()
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.header.frame_id = 'base_link'
+        marker.type = Marker.LINE_STRIP
+        marker.action = Marker.ADD
+        marker.scale.x = 0.01
+        marker.scale.y = 0.01
+        marker.scale.z = 0.0
+        marker.color.a = 1.0
+        marker.color.r = 1.0
+        marker.color.g = 0.0
+        marker.color.b = 0.0
+
+        points = [
+            geometry_msgs.msg.Point(x=x_min, y=y_min, z=0.0),
+            geometry_msgs.msg.Point(x=x_max, y=y_min, z=0.0),
+            geometry_msgs.msg.Point(x=x_max, y=y_max, z=0.0),
+            geometry_msgs.msg.Point(x=x_min, y=y_max, z=0.0),
+            geometry_msgs.msg.Point(x=x_min, y=y_min, z=0.0)
+        ]
+
+        marker.points.extend(points)
+        self.marker_publisher.publish(marker)
 
     def publish_polygon_marker(self, grouped_points):
         """Publish a polygon marker based on grouped points."""
@@ -448,6 +528,13 @@ class DistanceCalculator(Node):
             centroid_x = np.mean(group_np[:, 0])
             centroid_y = np.mean(group_np[:, 1])
             centroids.append((centroid_x, centroid_y))
+            left_points, right_points = self.split_points_by_kmeans(grouped_points)
+
+            self.perform_ransac(left_points, self.ax, color='blue')
+            self.perform_ransac(right_points, self.ax, color='red')
+
+            self.ax.scatter(left_points[:, 0], left_points[:, 1], color='blue', label='Front')
+            self.ax.scatter(right_points[:, 0], right_points[:, 1], color='red', label='Back')
 
             self.ax.scatter(
                 centroid_x,
@@ -489,6 +576,39 @@ class DistanceCalculator(Node):
         self.ax.set_ylabel("Y (meters)")
         self.ax.set_title("Real-time Lidar Detection Graph")
         plt.pause(0.001)
+
+    def split_points_by_kmeans(self, grouped_points):
+        """Use KMeans to separate points into left and right clusters"""
+        # Flatten the list of grouped points into a single array
+        all_points = np.vstack(grouped_points)
+
+        # Apply KMeans clustering with 2 clusters (left and right)
+        kmeans = KMeans(n_clusters=2, random_state=0).fit(all_points)
+
+        # Get the labels assigned by KMeans
+        labels = kmeans.labels_
+
+        # Separate points based on KMeans labels
+        left_points = all_points[labels == 0]
+        right_points = all_points[labels == 1]
+
+        return left_points, right_points
+
+    def perform_ransac(self, points, ax, color='blue'):
+        """Apply RANSAC to fit a line to the points"""
+        if len(points) < 2:
+            return
+
+        points = np.array(points)
+        ransac = RANSACRegressor()
+        ransac.fit(points[:, 0].reshape(-1, 1), points[:, 1])
+
+        # Predict the line using the RANSAC model
+        line_x = np.linspace(min(points[:, 0]), max(points[:, 0]), 100)
+        line_y = ransac.predict(line_x.reshape(-1, 1))
+
+        # Plot the line
+        ax.plot(line_x, line_y, color=color, linewidth=2, label=f'RANSAC {color}')
 
     def save_plot(self):
         timestamp = self.get_clock().now().to_msg().sec
